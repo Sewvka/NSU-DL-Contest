@@ -1,0 +1,13 @@
+.venv/
+catboost_info/
+data/
+processed/
+features/
+baseline_model.cbm
+train_out
+image.png
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.idea/
