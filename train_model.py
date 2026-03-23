@@ -1,13 +1,14 @@
 import polars as pl
+import pandas as pd
 import os
 import glob
 from catboost import CatBoostClassifier, Pool
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 import gc
 from datetime import datetime
 
 def train_model():
-    print("--- Starting Memory-Optimized Training ---")
+    print("--- Starting FINAL Elite Training on 100% Data ---")
     
     # 1. Загружаем лейблы и стат-фичи
     labels = pl.read_parquet("data/train_labels.parquet").select([
@@ -15,109 +16,157 @@ def train_model():
         pl.col("event_id"), 
         pl.col("target").cast(pl.Int8)
     ])
-    
-    # Статистика клиентов (которую мы собрали ранее)
     stats = pl.read_parquet("features/customer_stats.parquet")
     
-    # 2. Определяем колонки
+    # 2. Список файлов и колонок
     train_files = sorted(glob.glob("processed/train_*.parquet"))
-    # Берем список фичей из первого файла
     schema = pl.scan_parquet(train_files[0]).collect_schema()
-    drop_cols = ["customer_id", "event_id", "event_dttm", "dttm"]
+    
+    drop_cols = ["customer_id", "event_id", "event_dttm", "dttm", "session_id", "device_system_version"]
     features = [c for c in schema.names() if c not in drop_cols]
-    
-    # MCC и другие категории
-    cat_features = [
-        'mcc_code', 'event_type_nm', 'event_desc', 'channel_indicator_type', 
-        'channel_indicator_sub_type', 'currency_iso_cd', 'pos_cd', 
-        'timezone', 'operating_system_type', 'hour', 'weekday'
+
+    # Полный список новых признаков
+    new_cols = [
+        "amt_to_avg_ratio", "amt_to_max_ratio", "is_night", 
+        "total_customer_trans", "sec_since_last_trans", 
+        "user_mcc_count", "mcc_amt_share", "is_new_mcc",
+        "trans_count_10m", "trans_count_1h", "avg_amt_1h",
+        "mcc_global_risk", "amt_z_score_mcc", "amt_to_recent_avg", "is_mcc_change"
     ]
-    # Оставляем только те, что есть в данных
-    cat_features = [c for c in cat_features if c in features]
-
-    print(f"Features count: {len(features)} + {len(stats.columns)-1} stats")
-
-    # 3. Собираем выборку для обучения (Sampling)
-    # Чтобы влезть в 8ГБ, мы возьмем ВСЕ размеченные (87к) и ~1.5 млн неразмеченных (Зеленых)
-    full_train_list = []
     
-    for f in train_files:
-        print(f"Processing {f} for sampling...")
-        # Джойним файл с лейблами (Left join чтобы увидеть неразмеченные)
-        q = pl.scan_parquet(f).join(labels.lazy(), on=["customer_id", "event_id"], how="left")
-        
-        # Размеченные (Target 1 или 0 из файла лейблов)
-        labeled = q.filter(pl.col("target").is_not_null())
-        
-        # Неразмеченные (Зеленые) - берем случайные ~2% через хеш event_id
-        # Это самый стабильный способ ленивого сэмплирования в Polars
-        green = q.filter(
-            (pl.col("target").is_null()) & 
-            (pl.col("event_id").hash(42).mod(100) < 2)
-        )
-        
-        # Объединяем и заполняем таргет для зеленых (0)
-        chunk = pl.concat([labeled, green]).with_columns(
-            pl.col("target").fill_null(0)
-        ).join(stats.lazy(), on="customer_id", how="left")
-        
-        full_train_list.append(chunk.collect())
-        gc.collect()
+    final_cols = list(set(features + [c for c in stats.columns if c != "customer_id"] + new_cols))
+    X_cols = [c for c in final_cols if c not in drop_cols]
 
-    df = pl.concat(full_train_list)
-    del full_train_list
-    gc.collect()
-
-    # 4. Временной сплит (Валидация на последних данных)
     split_date = datetime(2025, 5, 1)
-    train_df = df.filter(pl.col("dttm") < split_date)
-    val_df = df.filter(pl.col("dttm") >= split_date)
     
-    print(f"Final Train size: {train_df.height}, Val size: {val_df.height}")
-    
-    # Готовим данные для CatBoost
-    y_train = train_df["target"].to_pandas()
-    y_val = val_df["target"].to_pandas()
-    
-    # Все колонки кроме служебных и таргета
-    X_cols = features + [c for c in stats.columns if c != "customer_id"]
-    X_train = train_df.select(X_cols).to_pandas()
-    X_val = val_df.select(X_cols).to_pandas()
-    
-    del df, train_df, val_df
-    gc.collect()
+    # 3. Подготовка валидации ( sampled for memory )
+    print("Preparing Validation Set (Sampled to 500k rows)...")
+    X_val_list, y_val_list = [], []
+    cat_features = None
 
-    # Обработка категорий (строки для CatBoost)
-    for col in cat_features:
-        if col in X_train.columns:
-            X_train[col] = X_train[col].astype(str).fillna("NaN")
-            X_val[col] = X_val[col].astype(str).fillna("NaN")
+    for f in train_files:
+        q = pl.scan_parquet(f).filter(
+            (pl.col("dttm") >= split_date) & 
+            (pl.col("event_id").hash(42).mod(100) < 5)
+        ).join(labels.lazy(), on=["customer_id", "event_id"], how="left"
+        ).with_columns(pl.col("target").fill_null(0)
+        ).join(stats.lazy(), on="customer_id", how="left").with_columns([
+            (pl.col("operaton_amt") / (pl.col("user_avg_amt") + 1)).cast(pl.Float32).alias("amt_to_avg_ratio"),
+            (pl.col("operaton_amt") / (pl.col("user_max_amt") + 1)).cast(pl.Float32).alias("amt_to_max_ratio"),
+            pl.when(pl.col("hour").is_between(0, 6)).then(1).otherwise(0).cast(pl.Int8).alias("is_night")
+        ])
+        
+        df_v = q.collect(engine="streaming")
+        if df_v.height > 0:
+            actual_cols = [c for c in X_cols if c in df_v.columns]
+            X_v_chunk = df_v.select(actual_cols).to_pandas()
+            if cat_features is None:
+                cat_features = X_v_chunk.select_dtypes(exclude=['number']).columns.tolist()
+                numeric_cats = ['mcc_code', 'hour', 'weekday', 'day', 'is_night', 'is_mcc_change', 'is_new_mcc']
+                cat_features = sorted(list(set(cat_features + [c for c in numeric_cats if c in X_v_chunk.columns])))
+            
+            for col in cat_features:
+                X_v_chunk[col] = X_v_chunk[col].astype(str).fillna("NaN")
+            X_val_list.append(X_v_chunk)
+            y_val_list.append(df_v["target"].to_pandas())
+        del df_v; gc.collect()
 
-    # 5. Обучение
-    print("Training CatBoost...")
-    model = CatBoostClassifier(
-        iterations=1500,
-        learning_rate=0.05,
-        depth=6,
-        eval_metric='PRAUC', # Целевая метрика соревнования
-        random_seed=42,
-        verbose=100,
-        early_stopping_rounds=100,
-        task_type="CPU"
-    )
+    X_val = pd.concat(X_val_list); del X_val_list
+    y_val = pd.concat(y_val_list); del y_val_list
+    print(f"Validation data ready: {len(X_val)} rows.")
+
+    # 4. Итеративное обучение
+    model_path = "current_model.cbm"
+    if os.path.exists(model_path): os.remove(model_path)
     
-    train_pool = Pool(X_train, y_train, cat_features=cat_features)
-    val_pool = Pool(X_val, y_val, cat_features=cat_features)
+    pos_weight = 300
+    params = {
+        'iterations': 250, # Увеличено для максимального качества
+        'learning_rate': 0.04,
+        'depth': 7,        # Оптимально для 16ГБ
+        'eval_metric': 'PRAUC',
+        'random_seed': 42,
+        'verbose': 50,
+        'scale_pos_weight': pos_weight,
+        'task_type': "CPU"
+    }
+
+    step = 0
+    for f in train_files:
+        print(f"\n--- Processing File: {f} ---")
+        total_rows = pl.scan_parquet(f).filter(pl.col("dttm") < split_date).collect().height
+        chunk_size = 5_000_000
+        
+        for offset in range(0, total_rows, chunk_size):
+            step += 1
+            print(f"  Step {step}: rows {offset} to {min(offset+chunk_size, total_rows)}...")
+            
+            q = pl.scan_parquet(f).filter(pl.col("dttm") < split_date).slice(offset, chunk_size).join(
+                labels.lazy(), on=["customer_id", "event_id"], how="left"
+            ).with_columns(pl.col("target").fill_null(0)
+            ).join(stats.lazy(), on="customer_id", how="left").with_columns([
+                (pl.col("operaton_amt") / (pl.col("user_avg_amt") + 1)).cast(pl.Float32).alias("amt_to_avg_ratio"),
+                (pl.col("operaton_amt") / (pl.col("user_max_amt") + 1)).cast(pl.Float32).alias("amt_to_max_ratio"),
+                pl.when(pl.col("hour").is_between(0, 6)).then(1).otherwise(0).cast(pl.Int8).alias("is_night")
+            ])
+            
+            df_t = q.collect(engine="streaming")
+            if df_t.height == 0: continue
+                
+            actual_cols = [c for c in X_cols if c in df_t.columns]
+            X_t = df_t.select(actual_cols).to_pandas()
+            for col in cat_features:
+                X_t[col] = X_t[col].astype(str).fillna("NaN")
+            y_t = df_t["target"].to_pandas()
+            
+            if y_t.nunique() < 2:
+                print(f"  Skipping Step {step}: target contains only one class.")
+                del df_t, X_t, y_t; gc.collect()
+                continue
+
+            train_pool = Pool(X_t, y_t, cat_features=cat_features)
+            val_pool = Pool(X_val, y_val, cat_features=cat_features)
+            del df_t, X_t, y_t; gc.collect()
+
+            current_params = params.copy()
+            if step > 1:
+                current_params['learning_rate'] = 0.02 
+
+            clf = CatBoostClassifier(**current_params)
+            
+            if step == 1:
+                clf.fit(train_pool, eval_set=val_pool)
+            else:
+                clf.fit(train_pool, eval_set=val_pool, init_model=model_path)
+            
+            clf.save_model(model_path)
+            del train_pool, val_pool, clf; gc.collect()
+
+    # 5. Итоговые результаты и важность признаков
+    final_model = CatBoostClassifier().load_model(model_path)
+    final_val_pool = Pool(X_val, y_val, cat_features=cat_features)
+    y_pred = final_model.predict_proba(final_val_pool)[:, 1]
     
-    model.fit(train_pool, eval_set=val_pool)
-    
-    # 6. Валидация
-    y_pred = model.predict_proba(val_pool)[:, 1]
     prauc = average_precision_score(y_val, y_pred)
-    print(f"\n--- Validation PR-AUC: {prauc:.4f} ---")
+    rocauc = roc_auc_score(y_val, y_pred)
     
-    model.save_model("baseline_model.cbm")
-    print("Model saved to baseline_model.cbm")
+    print(f"\n--- FINAL ELITE RESULTS ---")
+    print(f"PR-AUC:  {prauc:.6f}")
+    print(f"ROC-AUC: {rocauc:.6f}")
+    
+    # Вывод важности признаков
+    feat_imp = pd.DataFrame({
+        'feature': final_model.feature_names_,
+        'importance': final_model.get_feature_importance()
+    }).sort_values(by='importance', ascending=False)
+    
+    print("\nTop 20 Important Features:")
+    print(feat_imp.head(20))
+    
+    if os.path.exists("baseline_model.cbm"):
+        os.remove("baseline_model.cbm")
+    os.rename(model_path, "baseline_model.cbm")
+    print("Final model saved to baseline_model.cbm")
 
 if __name__ == "__main__":
     train_model()
