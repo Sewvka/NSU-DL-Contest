@@ -10,13 +10,13 @@ from datetime import datetime
 def train_model():
     print("--- Starting FINAL Elite Training on 100% Data ---")
     
-    # 1. Загружаем лейблы и стат-фичи
+    # 1. Загружаем лейблы и "чистую" базу статистики (без утечек из будущего)
     labels = pl.read_parquet("data/train_labels.parquet").select([
         pl.col("customer_id"), 
         pl.col("event_id"), 
         pl.col("target").cast(pl.Int8)
     ])
-    stats = pl.read_parquet("features/customer_stats.parquet")
+    stats = pl.read_parquet("features/train_baseline_stats.parquet")
     
     # 2. Список файлов и колонок
     train_files = sorted(glob.glob("processed/train_*.parquet"))
@@ -24,20 +24,21 @@ def train_model():
     
     drop_cols = ["customer_id", "event_id", "event_dttm", "dttm", "session_id", "device_system_version"]
     features = [c for c in schema.names() if c not in drop_cols]
+    
+    # ВАЛИДАЦИЯ: Последние 10 дней мая 2025 для проверки
+    split_date = datetime(2025, 5, 20)
+    print(f"Validation Split Date: {split_date}")
 
-    # Полный список новых признаков
+    # Полный список признаков (базовые + из статистики + вычисляемые на лету)
     new_cols = [
         "amt_to_avg_ratio", "amt_to_max_ratio", "is_night", 
-        "total_customer_trans", "sec_since_last_trans", 
-        "user_mcc_count", "mcc_amt_share", "is_new_mcc",
+        "sec_since_last_trans", "user_mcc_count", "mcc_amt_share", "is_new_mcc",
         "trans_count_10m", "trans_count_1h", "avg_amt_1h",
         "mcc_global_risk", "amt_z_score_mcc", "amt_to_recent_avg", "is_mcc_change"
     ]
     
     final_cols = list(set(features + [c for c in stats.columns if c != "customer_id"] + new_cols))
     X_cols = [c for c in final_cols if c not in drop_cols]
-
-    split_date = datetime(2025, 5, 1)
     
     # 3. Подготовка валидации ( sampled for memory )
     print("Preparing Validation Set (Sampled to 500k rows)...")
