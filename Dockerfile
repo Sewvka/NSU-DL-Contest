@@ -1,22 +1,27 @@
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
-# Install python, pip, and build tools
+# Fix SSL and installation issues
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-dev \
     build-essential \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 
-# Upgrade pip and set high timeout to prevent ReadTimeoutError
-RUN pip install --no-cache-dir --upgrade pip
+# Upgrade certificates and pip
+RUN update-ca-certificates && \
+    pip install --no-cache-dir --upgrade pip
 
-# Install dependencies with increased timeout and retries
+# Install dependencies with bypassed SSL checks
 COPY requirements.txt .
 RUN pip install --no-cache-dir \
     --default-timeout=1000 \
     --retries 5 \
+    --trusted-host pypi.org \
+    --trusted-host pypi.python.org \
+    --trusted-host files.pythonhosted.org \
     -r requirements.txt
 
 # Copy project files
