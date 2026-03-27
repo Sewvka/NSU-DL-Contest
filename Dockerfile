@@ -7,18 +7,24 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 
-# Upgrade certificates and pip
-RUN update-ca-certificates && \
-    pip install --no-cache-dir --upgrade pip
+# Environment variables to ignore SSL errors at the python level
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV PYTHONHTTPSVERIFY=0
 
-# Install dependencies with bypassed SSL checks
+# Upgrade pip and certifi
+RUN pip install --no-cache-dir --upgrade pip certifi
+
+# Install dependencies using a Mirror and bypassing SSL checks
 COPY requirements.txt .
 RUN pip install --no-cache-dir \
     --default-timeout=1000 \
-    --retries 5 \
+    --retries 10 \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    --trusted-host pypi.tuna.tsinghua.edu.cn \
     --trusted-host pypi.org \
     --trusted-host pypi.python.org \
     --trusted-host files.pythonhosted.org \
