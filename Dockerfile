@@ -1,41 +1,37 @@
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
-# Fix SSL and installation issues
+# Use bash for better control
+SHELL ["/bin/bash", "-c"]
+
+# Minimal system setup
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-dev \
-    build-essential \
     ca-certificates \
-    curl \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 
-# Environment variables to ignore SSL errors at the python level
-ENV PIP_ROOT_USER_ACTION=ignore
-ENV PYTHONHTTPSVERIFY=0
+# Configure pip for maximum stability
+# 1. High timeout
+# 2. No cache (prevents some SSL issues)
+# 3. Disable IPv6 (crucial for some networks)
+ENV PIP_DEFAULT_TIMEOUT=1000
+ENV PIP_NO_CACHE_DIR=1
 
-# Upgrade pip and certifi
-RUN pip install --no-cache-dir --upgrade pip certifi
+RUN pip install --upgrade pip
 
-# Install dependencies using a Mirror and bypassing SSL checks
+# Install dependencies one by one to pinpoint issues
 COPY requirements.txt .
-RUN pip install --no-cache-dir \
-    --default-timeout=1000 \
-    --retries 10 \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
-    --trusted-host pypi.org \
-    --trusted-host pypi.python.org \
-    --trusted-host files.pythonhosted.org \
-    -r requirements.txt
+RUN pip install certifi && \
+    pip install numpy==2.4.3 && \
+    pip install pandas==3.0.1 && \
+    pip install polars==1.39.3 && \
+    pip install catboost==1.2.10 && \
+    pip install -r requirements.txt
 
-# Copy project files
 WORKDIR /app
 COPY . .
-
-# Set permissions for the script
 RUN chmod +x run_pipeline.sh
 
-# Default command: run the whole pipeline
 CMD ["./run_pipeline.sh"]
