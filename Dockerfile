@@ -1,6 +1,6 @@
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
-# Используем локальные пакеты, интернет не нужен
+# Устанавливаем python 3.10
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
@@ -9,14 +9,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Копируем список и заранее скачанные пакеты
-COPY requirements.txt .
-COPY packages/ ./packages/
+# Копируем пакеты
+COPY packages/ /app/packages/
 
-# Установка СТРОГО из локальной папки (--no-index запрещает лезть в сеть)
-RUN pip install --no-index --find-links=./packages -r requirements.txt
+# Устанавливаем всё содержимое папки напрямую (это надежнее, чем по списку)
+# Мы просто говорим pip: "поставь всё, что найдешь в этой папке"
+RUN pip install --no-cache-dir --no-index --find-links=/app/packages /app/packages/*.whl
 
-# Копируем остальной код
+# Теперь копируем остальной код
 COPY . .
 RUN chmod +x run_pipeline.sh
 
